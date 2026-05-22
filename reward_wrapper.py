@@ -360,7 +360,7 @@ class GripperPenaltyWrapper(gym.Wrapper):
         if "intervene_action" in info:
             action = info["intervene_action"]
 
-        info['discrete_penalty'] == 0.0
+        info['discrete_penalty'] = 0.0
 
         if self.dual_arm:
             if "tienkung" in self.robot_type:
