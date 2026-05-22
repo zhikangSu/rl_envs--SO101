@@ -62,7 +62,7 @@ class MultiCameraBinaryRewardClassifierWrapper(gym.Wrapper):
         observation_space = copy.deepcopy(env.observation_space)
         self.algorithm = classifier_cfg.algorithm
         self.robot_type = env.unwrapped.robot_type
-        self.device = torch.device("cuda:0")
+        self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
         
         if self.load_classifier:
             self.cfg = cfg
