@@ -70,6 +70,18 @@ class SO101Station:
             self._joint_mid = (self._joint_min + self._joint_max) / 2.0
             self._joint_half = (self._joint_max - self._joint_min) / 2.0
 
+    # Motor order must match SO101Follower.__init__ in lerobot/robots/so101_follower/so101_follower.py.
+    # Used to convert cfg.max_relative_target (list of 6) into the dict form
+    # ensure_safe_goal_position expects.
+    _MOTOR_NAMES_FOLLOWER = (
+        "shoulder_pan",
+        "shoulder_lift",
+        "elbow_flex",
+        "wrist_flex",
+        "wrist_roll",
+        "gripper",
+    )
+
     def _build_follower(self):
         # Deferred imports so the module can be imported without lerobot fully ready
         # (e.g. during fake_env dry-runs or static analysis).
@@ -87,10 +99,26 @@ class SO101Station:
                 fps=int(cam_cfg.fps),
             )
 
+        # Per-joint single-step relative-target clamp. lerobot's ensure_safe_goal_position
+        # accepts float (one cap for all motors) or dict[motor_name -> cap]. cfg gives a list,
+        # so convert to dict here. Without this the follower runs at native servo speed (≈300°/s),
+        # which is unsafe for first-time hardware bring-up.
+        max_rel = getattr(self.cfg, "max_relative_target", None)
+        max_rel_dict = None
+        if max_rel is not None:
+            max_rel_list = [float(x) for x in list(max_rel)]
+            assert len(max_rel_list) == len(self._MOTOR_NAMES_FOLLOWER), (
+                f"max_relative_target length {len(max_rel_list)} != "
+                f"motor count {len(self._MOTOR_NAMES_FOLLOWER)}"
+            )
+            max_rel_dict = dict(zip(self._MOTOR_NAMES_FOLLOWER, max_rel_list))
+            logging.info(f"[SO101Station] max_relative_target (per tick): {max_rel_dict}")
+
         follower_cfg = SO101FollowerConfig(
             port=str(self.cfg.so101_follower_port),
             id=str(self.cfg.so101_follower_id),
             cameras=camera_objs,
+            max_relative_target=max_rel_dict,
         )
         return SO101Follower(follower_cfg)
 
