@@ -286,11 +286,19 @@ class SO101LeaderIntervention(gym.ActionWrapper):
             self.leader_torque_enabled = False
 
     def _mirror_leader_to_follower(self):
-        """Drive leader to match follower current joint state (active servo)."""
-        self._enable_leader_torque()
+        """Drive leader to match follower current joint state (active servo).
+
+        Order matters for safety: write Goal_Position BEFORE enabling torque.
+        If we enable torque first, the servo will spring to whatever stale Goal_Position
+        value is in the firmware register (could be far from current pose), causing a
+        sudden jerk before the new goal is written. By writing the goal first while
+        torque is still off, the servo holds in place until torque enable, at which
+        point it's already pointing at the correct target.
+        """
         follower = self._read_follower_joints()  # 6-dim (5 arm + 1 gripper)
         goal = {f"{n}": float(follower[i]) for i, n in enumerate(self._leader_motor_names)}
         self.leader.bus.sync_write("Goal_Position", goal)
+        self._enable_leader_torque()
 
     def step(self, action):
         leader = self._read_leader_joints()
