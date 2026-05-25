@@ -303,33 +303,35 @@ class SO101LeaderIntervention(gym.ActionWrapper):
     def step(self, action):
         leader = self._read_leader_joints()
         follower = self._read_follower_joints()
-
-        # Auto-detect: large leader-follower arm joint error == human is grabbing leader
         arm_err = float(np.linalg.norm(leader[:-1] - follower[:-1]))
-        is_intervention = arm_err > self.error_threshold
 
-        if is_intervention:
-            self._disable_leader_torque()
-            # joint-mode: replace action with leader joint reading (5 arm deg + 1 binary gripper)
-            arm_target = leader[:-1]
-            gripper_binary = 1.0 if leader[-1] > self.gripper_binary_threshold else 0.0
-            new_action = np.concatenate([arm_target, [gripper_binary]]).astype(np.float32)
-            obs, rew, terminated, truncated, info = self.env.step(new_action)
-            info["intervene_action"] = new_action
-            info["is_intervention"] = True
-        else:
-            # Mirror leader to follower so it stays in sync; ready for next grab.
-            self._mirror_leader_to_follower()
-            obs, rew, terminated, truncated, info = self.env.step(action)
-            info["is_intervention"] = False
-
+        # Pure-teleop mode: leader is always a passive position sensor (torque off
+        # permanently), follower always tracks leader. This drops the original
+        # HIL-SERL "policy autonomous / human grab to override" state machine because
+        # for demonstration collection / dry-run there is no autonomous policy to
+        # grab from. The torque-on mirror mode produced bad UX (had to push past the
+        # error_threshold to overcome servo holding torque every cycle).
+        #
+        # If you later want HIL-SERL torque-assist (leader physically mirrors the
+        # policy's commanded follower pose so the operator feels the agent's intent
+        # and can grab to correct), revert this block to the original threshold-based
+        # is_intervention logic and re-enable _mirror_leader_to_follower.
+        self._disable_leader_torque()
+        arm_target = leader[:-1]
+        gripper_binary = 1.0 if leader[-1] > self.gripper_binary_threshold else 0.0
+        new_action = np.concatenate([arm_target, [gripper_binary]]).astype(np.float32)
+        obs, rew, terminated, truncated, info = self.env.step(new_action)
+        info["intervene_action"] = new_action
+        info["is_intervention"] = True
         info["leader_follower_arm_error_deg"] = arm_err
         return obs, rew, terminated, truncated, info
 
     def reset(self, **kwargs):
         obs, info = self.env.reset(**kwargs)
-        self._mirror_leader_to_follower()
-        info["is_intervention"] = False
+        # Keep leader passive across the reset as well — no mirror sync. Operator is
+        # expected to hold the leader near the follower's reset pose before resuming.
+        self._disable_leader_torque()
+        info["is_intervention"] = True
         return obs, info
 
     def close(self):
