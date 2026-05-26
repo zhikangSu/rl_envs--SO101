@@ -1,4 +1,6 @@
+import logging
 import time
+from collections import deque
 import numpy as np
 from gymnasium import Env, spaces
 import gymnasium as gym
@@ -222,31 +224,38 @@ class SpaceMouseIntervention(gym.ActionWrapper):
 class SO101LeaderIntervention(gym.ActionWrapper):
     """SO101 leader-arm intervention for joint control.
 
-    Two modes (auto-switched based on leader-follower joint position error):
+    Default mode is policy-autonomous: the policy command is sent to the follower, and
+    the leader is servoed to mirror the follower's current joint state. If the operator
+    pulls the leader away from the mirrored pose, the wrapper switches to intervention:
+    leader torque is disabled and follower commands are replaced by leader joint targets.
 
-    1. Non-intervention (policy autonomous):
-       - leader.Torque_Enable = 1 (active servo)
-       - Every step: read follower joint state, write to leader Goal_Position
-       - Result: leader physically mirrors follower so when the human grabs the leader,
-         it is already at the correct pose and there is no jump.
-
-    2. Intervention (human takes over):
-       - leader.Torque_Enable = 0 (passive, can be moved by hand)
-       - Every step: read leader joint state, replace action with it
-       - follower copies leader joint position (1:1, no IK in joint mode)
-
-    Switch trigger: ||leader_arm_joints - follower_arm_joints||_2 > error_threshold
-    (excludes gripper since gripper jitter is unrelated to "user is grabbing the arm").
-
-    Reference: lerobot fork's BaseLeaderControlWrapper in
-    src/lerobot/scripts/rl/gym_manipulator.py (EE-delta variant for SO100). This is the
-    joint-mode simplification.
+    Release uses a small state machine instead of a raw threshold. After takeover, the
+    wrapper waits until the leader has been still for a few ticks and leader/follower
+    error is small, then it mirrors the leader back to the follower and resumes policy.
     """
 
-    def __init__(self, env, error_threshold_deg=8.0, gripper_binary_threshold_pct=15.0):
+    def __init__(
+        self,
+        env,
+        error_threshold_deg=8.0,
+        gripper_binary_threshold_pct=15.0,
+        release_error_threshold_deg=None,
+        release_motion_threshold_deg=0.75,
+        min_intervention_s=0.5,
+        release_queue_size=4,
+    ):
         super().__init__(env)
         self.error_threshold = float(error_threshold_deg)
         self.gripper_binary_threshold = float(gripper_binary_threshold_pct)
+        if release_error_threshold_deg is None:
+            release_error_threshold_deg = max(2.0, self.error_threshold * 0.5)
+        self.release_error_threshold = float(release_error_threshold_deg)
+        self.release_motion_threshold = float(release_motion_threshold_deg)
+        self.min_intervention_s = float(min_intervention_s)
+        self.leader_motion_queue = deque(maxlen=max(1, int(release_queue_size)))
+        self.is_intervening = False
+        self.intervention_started_at = None
+        self.prev_leader_arm = None
         self.leader = None
         self._leader_motor_names = None
         self.leader_torque_enabled = False
@@ -264,6 +273,17 @@ class SO101LeaderIntervention(gym.ActionWrapper):
         self.leader = SO101Leader(leader_cfg)
         self.leader.connect()
         self._leader_motor_names = list(self.leader.bus.motors)
+        for motor in self._leader_motor_names:
+            try:
+                self.leader.bus.write("P_Coefficient", motor, 16)
+                self.leader.bus.write("I_Coefficient", motor, 0)
+                self.leader.bus.write("D_Coefficient", motor, 16)
+            except Exception as exc:
+                logging.warning(
+                    "[SO101LeaderIntervention] failed to soften leader gains for %s: %s",
+                    motor,
+                    exc,
+                )
 
     def _read_leader_joints(self):
         action = self.leader.get_action()
@@ -300,38 +320,96 @@ class SO101LeaderIntervention(gym.ActionWrapper):
         self.leader.bus.sync_write("Goal_Position", goal)
         self._enable_leader_torque()
 
+    def _leader_to_action(self, leader):
+        arm_target = leader[:-1]
+        gripper_binary = 1.0 if leader[-1] > self.gripper_binary_threshold else 0.0
+        return np.concatenate([arm_target, [gripper_binary]]).astype(np.float32)
+
+    def _record_leader_motion(self, leader):
+        arm = leader[:-1].astype(np.float32, copy=True)
+        motion = 0.0
+        if self.prev_leader_arm is not None:
+            motion = float(np.linalg.norm(arm - self.prev_leader_arm))
+            self.leader_motion_queue.append(motion)
+        self.prev_leader_arm = arm
+        return motion
+
+    def _start_intervention(self, arm_err):
+        self.is_intervening = True
+        self.intervention_started_at = time.perf_counter()
+        self.leader_motion_queue.clear()
+        self._disable_leader_torque()
+        logging.info(
+            "[SO101LeaderIntervention] takeover started: leader/follower arm error %.2f deg",
+            arm_err,
+        )
+
+    def _should_release(self, arm_err):
+        if not self.is_intervening or self.intervention_started_at is None:
+            return False
+        if time.perf_counter() - self.intervention_started_at < self.min_intervention_s:
+            return False
+        if len(self.leader_motion_queue) < self.leader_motion_queue.maxlen:
+            return False
+        return (
+            arm_err <= self.release_error_threshold
+            and max(self.leader_motion_queue) <= self.release_motion_threshold
+        )
+
+    def _finish_intervention(self, arm_err):
+        self.is_intervening = False
+        self.intervention_started_at = None
+        self.leader_motion_queue.clear()
+        self._mirror_leader_to_follower()
+        logging.info(
+            "[SO101LeaderIntervention] takeover released: leader/follower arm error %.2f deg",
+            arm_err,
+        )
+
     def step(self, action):
         leader = self._read_leader_joints()
         follower = self._read_follower_joints()
         arm_err = float(np.linalg.norm(leader[:-1] - follower[:-1]))
+        leader_motion = self._record_leader_motion(leader)
 
-        # Pure-teleop mode: leader is always a passive position sensor (torque off
-        # permanently), follower always tracks leader. This drops the original
-        # HIL-SERL "policy autonomous / human grab to override" state machine because
-        # for demonstration collection / dry-run there is no autonomous policy to
-        # grab from. The torque-on mirror mode produced bad UX (had to push past the
-        # error_threshold to overcome servo holding torque every cycle).
-        #
-        # If you later want HIL-SERL torque-assist (leader physically mirrors the
-        # policy's commanded follower pose so the operator feels the agent's intent
-        # and can grab to correct), revert this block to the original threshold-based
-        # is_intervention logic and re-enable _mirror_leader_to_follower.
-        self._disable_leader_torque()
-        arm_target = leader[:-1]
-        gripper_binary = 1.0 if leader[-1] > self.gripper_binary_threshold else 0.0
-        new_action = np.concatenate([arm_target, [gripper_binary]]).astype(np.float32)
-        obs, rew, terminated, truncated, info = self.env.step(new_action)
-        info["intervene_action"] = new_action
-        info["is_intervention"] = True
+        if not self.is_intervening and arm_err > self.error_threshold:
+            self._start_intervention(arm_err)
+
+        if self.is_intervening:
+            new_action = self._leader_to_action(leader)
+            obs, rew, terminated, truncated, info = self.env.step(new_action)
+            post_follower = self._read_follower_joints()
+            post_arm_err = float(np.linalg.norm(leader[:-1] - post_follower[:-1]))
+            if self._should_release(post_arm_err):
+                self._finish_intervention(post_arm_err)
+            info["intervene_action"] = new_action
+            info["is_intervention"] = True
+            info["leader_follower_arm_error_deg"] = post_arm_err
+            info["leader_motion_deg"] = leader_motion
+            return obs, rew, terminated, truncated, info
+
+        obs, rew, terminated, truncated, info = self.env.step(action)
+        self._mirror_leader_to_follower()
+        info["is_intervention"] = False
         info["leader_follower_arm_error_deg"] = arm_err
+        info["leader_motion_deg"] = leader_motion
         return obs, rew, terminated, truncated, info
 
     def reset(self, **kwargs):
         obs, info = self.env.reset(**kwargs)
-        # Keep leader passive across the reset as well — no mirror sync. Operator is
-        # expected to hold the leader near the follower's reset pose before resuming.
-        self._disable_leader_torque()
-        info["is_intervention"] = True
+        self.is_intervening = False
+        self.intervention_started_at = None
+        self.leader_motion_queue.clear()
+        leader = self._read_leader_joints()
+        follower = self._read_follower_joints()
+        self.prev_leader_arm = leader[:-1].astype(np.float32, copy=True)
+        arm_err = float(np.linalg.norm(leader[:-1] - follower[:-1]))
+        if arm_err > self.error_threshold:
+            self._start_intervention(arm_err)
+        else:
+            self._mirror_leader_to_follower()
+        info["is_intervention"] = self.is_intervening
+        info["leader_follower_arm_error_deg"] = arm_err
         return obs, info
 
     def close(self):
