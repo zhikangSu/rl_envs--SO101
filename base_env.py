@@ -460,16 +460,16 @@ class BaseEnv(gym.Env):
             self.sync_xtele()
             while True:
                 try:
-                    input("Press Enter to continue...")
+                    input("[等待确认] 按 Enter 继续...")
                     break  # Break the loop if input is successful
                 except (EOFError, ValueError):
-                    print("Input is temporarily unavailable, retrying...")
+                    print("[提示] 暂时无法读取输入，正在重试...", flush=True)
                     traceback.print_exc()
                     time.sleep(1)
                     continue  
 
             shared_state.terminate = False
-            print("Reset the scene, press Space to continue...")
+            print("[等待开始] 请重置场景，确认安全后按 Space 开始。", flush=True)
             while not shared_state.terminate:
                 obs = self.get_xtele()
                 xtele_joints = obs['joints']
@@ -478,11 +478,10 @@ class BaseEnv(gym.Env):
                 self._send_joint_command(target_joint, include_gripper=True)
                 time.sleep(1 / self.hz)
 
-        print('go to reset!!!!!!!!!!')
+        print("\n[环境重置] 从臂正在回到 reset 位姿，请注意避让。", flush=True)
         self.go_to_reset(joint_reset=True)      
         shared_state.terminate = False
-        # print("重新摆放场景, 按空格继续: ")
-        print("Reset the scene, press Space to continue...")
+        print("[等待开始] 请摆好方块和杯子；确认安全后按 Space 开始下一条录制。", flush=True)
         while not shared_state.terminate:
             continue
         shared_state.terminate = False
@@ -816,4 +815,3 @@ class BaseEnv(gym.Env):
 
     def close(self):
         return
-

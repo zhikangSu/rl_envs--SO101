@@ -110,7 +110,7 @@ class MultiCameraBinaryRewardClassifierWrapper(gym.Wrapper):
             origin_root_path = os.path.dirname(classifier_cfg.dataset_path)
             task_name = os.path.basename(classifier_cfg.dataset_path)
 
-    
+
             cfg.dataset.root = os.path.join(origin_root_path, task_name + "_success")
             success_dataset = make_dataset(cfg)
             self.pos_buffer = ReplayBuffer.from_lerobot_dataset(
@@ -183,8 +183,7 @@ class MultiCameraBinaryRewardClassifierWrapper(gym.Wrapper):
         terminated = success
 
         if truncated:
-            # print("任务超时，将自动重置")
-            print("Task timed out, will be automatically reset")
+            print("[本条超时] 本条数据达到最大步数，将自动结束并进入环境重置。", flush=True)
             time.sleep(1)
 
         classifier_need_update = False
@@ -196,8 +195,11 @@ class MultiCameraBinaryRewardClassifierWrapper(gym.Wrapper):
         else:
             if terminated:   
                 start_time = time.time()
-                # print("模型判断任务成功，请按空格键确认，否则将在5秒后自动继续")
-                print("Model judged the task as successfully completed. If this is wrong, press the space bar to correct it; otherwise, the program will automatically continue after 5 seconds.")
+                print(
+                    "[成功候选] 奖励分类器判断本条已经成功。"
+                    "如果这是误判，请在 5 秒内按 Space 否定；否则将自动确认成功。",
+                    flush=True,
+                )
                 while True:
                     # If shared_state.terminate is used to flag failure, reset it to False after handling (task continues).
                     if shared_state.terminate:
@@ -205,12 +207,13 @@ class MultiCameraBinaryRewardClassifierWrapper(gym.Wrapper):
                         terminated = False
                         classifier_need_update = True
                         shared_state.terminate = False
+                        print("[成功否定] 已否定本次成功判断，继续当前条数据。", flush=True)
                         break
                     if time.time() - start_time > 5:
+                        print("[本条成功] 已自动确认成功，准备结束本条并进入环境重置。", flush=True)
                         break
             elif shared_state.terminate:
-                # print('人类判断任务成功')
-                print('Human judged the task as successfully completed.')
+                print("[本条成功] 已收到人工成功标记，准备结束本条并进入环境重置。", flush=True)
                 # If the human sets shared_state.terminate = True to confirm success, do not reset it (task ends).
                 classifier_need_update = True
                 terminated = True
@@ -385,6 +388,5 @@ class GripperPenaltyWrapper(gym.Wrapper):
             else:
                 info['discrete_penalty'] = 0.0
         self.last_gripper_pos = self.env.unwrapped.curr_gripper_joints
-        
+
         return observation, reward, terminated, truncated, info
-    
