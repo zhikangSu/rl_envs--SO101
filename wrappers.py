@@ -259,6 +259,9 @@ class SO101LeaderIntervention(gym.ActionWrapper):
         self.leader = None
         self._leader_motor_names = None
         self.leader_torque_enabled = False
+        cfg = self.env.unwrapped.config
+        self._joint_min = np.asarray(list(cfg.so101_joint_action_min), dtype=np.float32)
+        self._joint_max = np.asarray(list(cfg.so101_joint_action_max), dtype=np.float32)
         self._setup_leader()
 
     def _setup_leader(self):
@@ -325,6 +328,14 @@ class SO101LeaderIntervention(gym.ActionWrapper):
         gripper_binary = 1.0 if leader[-1] > self.gripper_binary_threshold else 0.0
         return np.concatenate([arm_target, [gripper_binary]]).astype(np.float32)
 
+    def _normalize_action_for_policy(self, action):
+        """Convert executed physical SO101 action to policy training scale."""
+        action = np.asarray(action, dtype=np.float32).copy()
+        action[:5] = 2.0 * (action[:5] - self._joint_min) / (self._joint_max - self._joint_min + 1e-8) - 1.0
+        action[:5] = np.clip(action[:5], -1.0, 1.0)
+        action[5] = 1.0 if action[5] >= 0.5 else 0.0
+        return action
+
     def _record_leader_motion(self, leader):
         arm = leader[:-1].astype(np.float32, copy=True)
         motion = 0.0
@@ -382,7 +393,7 @@ class SO101LeaderIntervention(gym.ActionWrapper):
             post_arm_err = float(np.linalg.norm(leader[:-1] - post_follower[:-1]))
             if self._should_release(post_arm_err):
                 self._finish_intervention(post_arm_err)
-            info["intervene_action"] = new_action
+            info["intervene_action"] = self._normalize_action_for_policy(new_action)
             info["is_intervention"] = True
             info["leader_follower_arm_error_deg"] = post_arm_err
             info["leader_motion_deg"] = leader_motion
