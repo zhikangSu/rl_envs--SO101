@@ -262,6 +262,13 @@ class SO101LeaderIntervention(gym.ActionWrapper):
         cfg = self.env.unwrapped.config
         self._joint_min = np.asarray(list(cfg.so101_joint_action_min), dtype=np.float32)
         self._joint_max = np.asarray(list(cfg.so101_joint_action_max), dtype=np.float32)
+        # Cache follower so we can bypass max_relative_target during human takeover.
+        # The per-tick clamp is a safety net for the policy; while a human is driving
+        # the leader, it just throttles the follower below leader hand speed and the
+        # follower never reaches the leader's pose. Save the original cap and disable
+        # it on _start_intervention, restore it on _finish_intervention.
+        self._follower = self.env.unwrapped.robot_station.follower
+        self._saved_max_relative_target = None
         self._setup_leader()
 
     def _setup_leader(self):
@@ -324,16 +331,16 @@ class SO101LeaderIntervention(gym.ActionWrapper):
         self._enable_leader_torque()
 
     def _leader_to_action(self, leader):
-        arm_target = leader[:-1]
-        gripper_binary = 1.0 if leader[-1] > self.gripper_binary_threshold else 0.0
-        return np.concatenate([arm_target, [gripper_binary]]).astype(np.float32)
+        # Match lerobot-teleoperate for takeover: send the leader's current
+        # LeRobot motor-normalized joint targets directly to the follower.
+        return leader.astype(np.float32, copy=True)
 
     def _normalize_action_for_policy(self, action):
         """Convert executed physical SO101 action to policy training scale."""
         action = np.asarray(action, dtype=np.float32).copy()
         action[:5] = 2.0 * (action[:5] - self._joint_min) / (self._joint_max - self._joint_min + 1e-8) - 1.0
         action[:5] = np.clip(action[:5], -1.0, 1.0)
-        action[5] = 1.0 if action[5] >= 0.5 else 0.0
+        action[5] = 1.0 if action[5] > self.gripper_binary_threshold else 0.0
         return action
 
     def _record_leader_motion(self, leader):
@@ -350,8 +357,13 @@ class SO101LeaderIntervention(gym.ActionWrapper):
         self.intervention_started_at = time.perf_counter()
         self.leader_motion_queue.clear()
         self._disable_leader_torque()
+        # Bypass the per-tick relative-target cap so the follower can keep up
+        # with leader hand motion (native servo speed ~300°/s vs. capped 60°/s).
+        if self._saved_max_relative_target is None:
+            self._saved_max_relative_target = self._follower.config.max_relative_target
+            self._follower.config.max_relative_target = None
         logging.info(
-            "[SO101LeaderIntervention] takeover started: leader/follower arm error %.2f deg",
+            "[SO101LeaderIntervention] takeover started: leader/follower arm error %.2f calibrated units",
             arm_err,
         )
 
@@ -371,9 +383,13 @@ class SO101LeaderIntervention(gym.ActionWrapper):
         self.is_intervening = False
         self.intervention_started_at = None
         self.leader_motion_queue.clear()
+        # Restore the per-tick cap before handing control back to the policy.
+        if self._saved_max_relative_target is not None:
+            self._follower.config.max_relative_target = self._saved_max_relative_target
+            self._saved_max_relative_target = None
         self._mirror_leader_to_follower()
         logging.info(
-            "[SO101LeaderIntervention] takeover released: leader/follower arm error %.2f deg",
+            "[SO101LeaderIntervention] takeover released: leader/follower arm error %.2f calibrated units",
             arm_err,
         )
 
@@ -387,13 +403,16 @@ class SO101LeaderIntervention(gym.ActionWrapper):
             self._start_intervention(arm_err)
 
         if self.is_intervening:
-            new_action = self._leader_to_action(leader)
+            new_action = {
+                "action": self._leader_to_action(leader),
+                "so101_action_units": "raw",
+            }
             obs, rew, terminated, truncated, info = self.env.step(new_action)
             post_follower = self._read_follower_joints()
             post_arm_err = float(np.linalg.norm(leader[:-1] - post_follower[:-1]))
             if self._should_release(post_arm_err):
                 self._finish_intervention(post_arm_err)
-            info["intervene_action"] = self._normalize_action_for_policy(new_action)
+            info["intervene_action"] = self._normalize_action_for_policy(new_action["action"])
             info["is_intervention"] = True
             info["leader_follower_arm_error_deg"] = post_arm_err
             info["leader_motion_deg"] = leader_motion

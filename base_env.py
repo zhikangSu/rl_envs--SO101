@@ -95,6 +95,7 @@ class BaseEnv(gym.Env):
         self.fix_gripper = config.fix_gripper
         self.ego_mode = config.ego_mode
         self.use_cmd_pose = config.use_cmd_pose
+        self.last_gripper_units = "policy"
         
         assert self.control_mode in ["joint", "pose"], f'Not valid control mode: {self.control_mode}'
         
@@ -379,16 +380,28 @@ class BaseEnv(gym.Env):
     def step(self, action: np.ndarray) -> Tuple[Dict[str, Any], int, bool, bool, Dict[str, Any]]:
         # ========== 控制执行频率 ==========
         start_time = time.time()  # 记录开始时间
+        action_units = None
+        if isinstance(action, dict) and "action" in action:
+            action_units = action.get("so101_action_units")
+            action = np.asarray(action["action"], dtype=np.float32)
+        elif "so101" in self.robot_type and self.control_mode == "joint":
+            # Actor actions are SAC tanh outputs in [-1, 1]. Reset paths bypass
+            # BaseEnv.step() and call _send_joint_command() directly with raw
+            # LeRobot motor-normalized joint targets.
+            action_units = "policy"
         
-        # 夹爪动作需要一定时间完成，频繁控制可能导致问题
-        # 如果距离上次夹爪动作超过 _gripper_sleep 秒，且未固定夹爪，则允许控制夹爪
-        if (time.time() - self.last_gripper_act > self._gripper_sleep) and not self.fix_gripper:
+        # Policy gripper commands keep the original sleep guard. Raw SO101
+        # takeover should match lerobot-teleoperate, so the leader gripper is
+        # forwarded continuously unless the environment explicitly fixes it.
+        if action_units == "raw" and "so101" in self.robot_type and self.control_mode == "joint":
+            include_gripper = not self.fix_gripper
+        elif (time.time() - self.last_gripper_act > self._gripper_sleep) and not self.fix_gripper:
             include_gripper = True
         else:
             include_gripper = False
 
         if self.control_mode == "joint":
-            self._send_joint_command(action, include_gripper) 
+            self._send_joint_command(action, include_gripper, action_units=action_units)
             # curr_pose_euler = None
         elif self.control_mode == "pose":
             action = action.clip(-1, 1)
@@ -454,6 +467,7 @@ class BaseEnv(gym.Env):
             }
         else:
             self.last_gripper_value = 1.0 if self.close_gripper else 0.0
+        self.last_gripper_units = "policy"
 
         if self.ego_mode:
             
@@ -475,7 +489,8 @@ class BaseEnv(gym.Env):
                 xtele_joints = obs['joints']
                 self._update_currpos()
                 target_joint = xtele_joints.copy()
-                self._send_joint_command(target_joint, include_gripper=True)
+                action_units = "raw" if "so101" in self.robot_type else None
+                self._send_joint_command(target_joint, include_gripper=True, action_units=action_units)
                 time.sleep(1 / self.hz)
 
         print("\n[环境重置] 从臂正在回到 reset 位姿，请注意避让。", flush=True)
@@ -495,6 +510,7 @@ class BaseEnv(gym.Env):
             }
         else:
             self.last_gripper_value = 1.0 if self.close_gripper else 0.0
+        self.last_gripper_units = "policy"
         obs = self._get_obs()
         return obs, {"succeed": False, "is_intervention": False}
 
@@ -571,7 +587,8 @@ class BaseEnv(gym.Env):
             # Generate a linear interpolation path from the current joints to the target joints (smooth transition)
             path = np.linspace(curr_joints, goal_joints, cnt)
             for p in path:
-                self._send_joint_command(p, include_gripper=False)
+                action_units = "raw" if "so101" in self.robot_type else None
+                self._send_joint_command(p, include_gripper=False, action_units=action_units)
                 time.sleep(1 / self.hz)
 
             self._update_currpos()
@@ -597,7 +614,7 @@ class BaseEnv(gym.Env):
                 time.sleep(1 / self.hz)
 
 
-    def _send_joint_command(self, joints: np.ndarray, include_gripper=False):
+    def _send_joint_command(self, joints: np.ndarray, include_gripper=False, action_units=None):
         if self.dual_arm:
             '''
             joints = {
@@ -648,13 +665,25 @@ class BaseEnv(gym.Env):
                 }
                 obs = self.robot_station.step(robot_target)
             elif "so101" in self.robot_type:
-                # SO101 joint mode: same xrocs-style payload as UR (joints + hand binary).
-                # SO101Station.step() converts the binary gripper to stroke percent internally.
+                # SO101 joint mode: policy actions are [-1, 1] arm targets +
+                # binary gripper; leader takeover actions are raw LeRobot
+                # motor-normalized values, matching lerobot-teleoperate.
+                gripper_units = self.last_gripper_units
+                if include_gripper and action_units == "raw":
+                    self.last_gripper_value = float(np.clip(gripper_value, 0.0, 100.0))
+                    self.last_gripper_units = "raw"
+                    gripper_units = "raw"
+                elif include_gripper:
+                    self.last_gripper_value = gripper_value_binary
+                    self.last_gripper_units = "policy"
+                    gripper_units = "policy"
                 robot_target = {
                     "arm_joints": {
                         "single": joints[0:self.joint_dim]
                     },
-                    "hand_joints": {"single": self.last_gripper_value}
+                    "hand_joints": {"single": self.last_gripper_value},
+                    "so101_action_units": action_units,
+                    "so101_gripper_units": gripper_units,
                 }
                 obs = self.robot_station.step(robot_target)
                 return obs
