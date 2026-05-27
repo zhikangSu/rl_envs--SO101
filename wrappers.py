@@ -433,16 +433,47 @@ class SO101LeaderIntervention(gym.ActionWrapper):
             self._follower.config.max_relative_target = self._saved_max_relative_target
             self._saved_max_relative_target = None
 
-        # Align follower (arm + gripper) to leader's current 6-DoF pose so the
-        # new episode starts with leader/follower matched — operator positions
-        # the leader at the desired initial pose, follower lands at the same
-        # pose. Avoids the spurious first-step takeover that fires when the
-        # follower defaults to cfg.reset_joint but the leader is elsewhere.
-        leader_initial = self._read_leader_joints()  # 6-dim (5 arm + 1 gripper)
         base = self.env.unwrapped
-        base._reset_joint = leader_initial[: base.joint_dim].astype(np.float32, copy=True)
-        base.last_gripper_value = float(np.clip(leader_initial[base.joint_dim], 0.0, 100.0))
+
+        # Default to follower's current pose so if the user skips A and goes
+        # straight to Space, env.reset's go_to_reset below is a no-op (no surprise
+        # physical motion before the operator has positioned the leader).
+        follower_now = self._read_follower_joints()
+        base._reset_joint = follower_now[: base.joint_dim].astype(np.float32, copy=True)
+        base.last_gripper_value = float(np.clip(follower_now[base.joint_dim], 0.0, 100.0))
         base.last_gripper_units = "raw"
+
+        # ── Interactive alignment phase ──
+        # User positions the leader. A → follower goes to leader's current 6-DoF
+        # pose. Repeat A to refine. Space → start episode.
+        print(
+            "[环境重置] 调整主臂到 episode 初始位姿后：\n"
+            "  A     = 从臂跟随主臂当前 6-DoF 位姿（可反复按 A 微调）\n"
+            "  Space = 开始录制",
+            flush=True,
+        )
+        shared_state.terminate = False
+        shared_state.align_request = False
+        while not shared_state.terminate:
+            if shared_state.align_request:
+                shared_state.align_request = False
+                leader = self._read_leader_joints()
+                base._reset_joint = leader[: base.joint_dim].astype(np.float32, copy=True)
+                base.last_gripper_value = float(np.clip(leader[base.joint_dim], 0.0, 100.0))
+                base.last_gripper_units = "raw"
+                print("[对齐] 读取主臂位姿，从臂跟随中...", flush=True)
+                base.go_to_reset(joint_reset=True)
+                print("[对齐] 完成。再按 A 微调，或按 Space 开始。", flush=True)
+            time.sleep(0.05)
+
+        # Sync target to follower's now-aligned pose so the env.reset() below
+        # finds go_to_reset a no-op (and fresh obs through the full wrapper chain
+        # reflects the aligned physical state).
+        follower_aligned = self._read_follower_joints()
+        base._reset_joint = follower_aligned[: base.joint_dim].astype(np.float32, copy=True)
+        base.last_gripper_value = float(np.clip(follower_aligned[base.joint_dim], 0.0, 100.0))
+        base.last_gripper_units = "raw"
+        shared_state.terminate = True  # skip env.reset's own Space wait
         obs, info = self.env.reset(**kwargs)
 
         self.is_intervening = False

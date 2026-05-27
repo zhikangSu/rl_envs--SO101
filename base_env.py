@@ -460,14 +460,17 @@ class BaseEnv(gym.Env):
     def reset(self, **kwargs):
         self._update_currpos()
         self.last_gripper_act = time.time()
-        if self.dual_arm:
-            self.last_gripper_value = {
-                "left": 1.0 if self.close_gripper else 0.0,
-                "right": 1.0 if self.close_gripper else 0.0,
-            }
-        else:
-            self.last_gripper_value = 1.0 if self.close_gripper else 0.0
-        self.last_gripper_units = "policy"
+        # SO101LeaderIntervention sets last_gripper_value/units explicitly to align the
+        # follower gripper with the leader's current pose on reset. Don't overwrite.
+        if "so101" not in self.robot_type:
+            if self.dual_arm:
+                self.last_gripper_value = {
+                    "left": 1.0 if self.close_gripper else 0.0,
+                    "right": 1.0 if self.close_gripper else 0.0,
+                }
+            else:
+                self.last_gripper_value = 1.0 if self.close_gripper else 0.0
+            self.last_gripper_units = "policy"
 
         if self.ego_mode:
             
@@ -503,14 +506,16 @@ class BaseEnv(gym.Env):
 
         self.curr_path_length = 0
         self.last_gripper_act = time.time()
-        if self.dual_arm:
-            self.last_gripper_value = {
-                "left": 1.0 if self.close_gripper else 0.0,
-                "right": 1.0 if self.close_gripper else 0.0,
-            }
-        else:
-            self.last_gripper_value = 1.0 if self.close_gripper else 0.0
-        self.last_gripper_units = "policy"
+        # SO101LeaderIntervention manages gripper state; see top-of-reset note.
+        if "so101" not in self.robot_type:
+            if self.dual_arm:
+                self.last_gripper_value = {
+                    "left": 1.0 if self.close_gripper else 0.0,
+                    "right": 1.0 if self.close_gripper else 0.0,
+                }
+            else:
+                self.last_gripper_value = 1.0 if self.close_gripper else 0.0
+            self.last_gripper_units = "policy"
         obs = self._get_obs()
         return obs, {"succeed": False, "is_intervention": False}
 
