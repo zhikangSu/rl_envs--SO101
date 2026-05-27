@@ -433,18 +433,17 @@ class SO101LeaderIntervention(gym.ActionWrapper):
             self._follower.config.max_relative_target = self._saved_max_relative_target
             self._saved_max_relative_target = None
 
-        # Override the fixed cfg.reset_joint with the leader's current arm pose,
-        # so the follower lands aligned with wherever the human last left the
-        # leader. Avoids the false-intervention trigger that fires when the user
-        # had moved the leader off the cfg reset_joint pose between episodes.
-        base = self.env.unwrapped
+        # Align follower (arm + gripper) to leader's current 6-DoF pose so the
+        # new episode starts with leader/follower matched — operator positions
+        # the leader at the desired initial pose, follower lands at the same
+        # pose. Avoids the spurious first-step takeover that fires when the
+        # follower defaults to cfg.reset_joint but the leader is elsewhere.
         leader_initial = self._read_leader_joints()  # 6-dim (5 arm + 1 gripper)
-        original_reset_joint = base._reset_joint.copy()
+        base = self.env.unwrapped
         base._reset_joint = leader_initial[: base.joint_dim].astype(np.float32, copy=True)
-        try:
-            obs, info = self.env.reset(**kwargs)
-        finally:
-            base._reset_joint = original_reset_joint
+        base.last_gripper_value = float(np.clip(leader_initial[base.joint_dim], 0.0, 100.0))
+        base.last_gripper_units = "raw"
+        obs, info = self.env.reset(**kwargs)
 
         self.is_intervening = False
         self.intervention_started_at = None
