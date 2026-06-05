@@ -106,6 +106,9 @@ class BaseEnv(gym.Env):
         tcp_pose_dim = 7  # 末端执行器位姿：xyz 位置(3) + 四元数旋转(4) = 7维
         if self.dual_arm:
             tcp_pose_dim = 2 * tcp_pose_dim  # 双臂，每臂7维
+        ee_pos_dim = 3
+        if self.dual_arm:
+            ee_pos_dim = 2 * ee_pos_dim
         
         gripper_dim = 1
         if self.dual_arm:
@@ -119,6 +122,9 @@ class BaseEnv(gym.Env):
             "tcp_pose": gym.spaces.Box(
                 -np.inf, np.inf, shape=(tcp_pose_dim,)
             ),  
+            "ee_pos": gym.spaces.Box(
+                -np.inf, np.inf, shape=(ee_pos_dim,)
+            ),
             "gripper_pose": gym.spaces.Box(0, 1, shape=(gripper_dim,)),  # 夹爪开合度：0=完全打开，1=完全关闭
             "joints": gym.spaces.Box(
                 -np.inf, np.inf, shape=(joint_dim,)
@@ -142,6 +148,12 @@ class BaseEnv(gym.Env):
                 self.action_space = gym.spaces.Box( 
                     np.array([-1, -1, -1, -1, -1, -1, 0, -1, -1, -1, -1, -1, -1, 0], dtype=np.float32),
                     np.array([1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1], dtype=np.float32),
+                )
+            elif "so101" in self.robot_type:
+                # SO101 EE control is position-only: normalized dx, dy, dz plus binary gripper.
+                self.action_space = gym.spaces.Box(
+                    np.array([-1, -1, -1, 0], dtype=np.float32),
+                    np.array([1, 1, 1, 1], dtype=np.float32),
                 )
             else:
                 # action_space = (xyz + rpy + gripper)
@@ -381,8 +393,10 @@ class BaseEnv(gym.Env):
         # ========== 控制执行频率 ==========
         start_time = time.time()  # 记录开始时间
         action_units = None
+        so101_action_mode = None
         if isinstance(action, dict) and "action" in action:
             action_units = action.get("so101_action_units")
+            so101_action_mode = action.get("so101_action_mode")
             action = np.asarray(action["action"], dtype=np.float32)
         elif "so101" in self.robot_type and self.control_mode == "joint":
             # Actor actions are SAC tanh outputs in [-1, 1]. Reset paths bypass
@@ -393,7 +407,12 @@ class BaseEnv(gym.Env):
         # Policy gripper commands keep the original sleep guard. Raw SO101
         # takeover should match lerobot-teleoperate, so the leader gripper is
         # forwarded continuously unless the environment explicitly fixes it.
-        if action_units == "raw" and "so101" in self.robot_type and self.control_mode == "joint":
+        so101_raw_joint_takeover = (
+            action_units == "raw"
+            and "so101" in self.robot_type
+            and (self.control_mode == "joint" or so101_action_mode == "joint")
+        )
+        if so101_raw_joint_takeover:
             include_gripper = not self.fix_gripper
         elif (time.time() - self.last_gripper_act > self._gripper_sleep) and not self.fix_gripper:
             include_gripper = True
@@ -404,33 +423,37 @@ class BaseEnv(gym.Env):
             self._send_joint_command(action, include_gripper, action_units=action_units)
             # curr_pose_euler = None
         elif self.control_mode == "pose":
-            action = action.clip(-1, 1)
-            if self.dual_arm:
-                if "tienkung" in self.robot_type:
-                    next_pose = {}
-                    dual_arm_action = {
-                        "left": action[0:7],
-                        "right": action[7:14],
-                    }
-
-                    for name, action in dual_arm_action.items():
-                        curr_pose = self.currpos[name]
-                        next_pose[name] = self.compute_next_pose(curr_pose, action)
-
-                        # 裁剪到安全边界
-                        next_pose[name] = self.clip_safety_box(next_pose[name], arm_name=name)  
-
-                    self.currpos = {name: self.pose_euler2quat(pose) for name, pose in next_pose.items()}
-                else:
-                    raise NotImplementedError("Unknown robot type")
-                
-            
+            if "so101" in self.robot_type and so101_action_mode == "joint":
+                self._send_joint_command(action, include_gripper, action_units=action_units)
             else:
-                next_pose = self.compute_next_pose(self.currpos, action)
-                next_pose = self.clip_safety_box(next_pose)
-                self.currpos = self.pose_euler2quat(next_pose)
+                action = action.clip(-1, 1)
+            if "so101" in self.robot_type and so101_action_mode != "joint":
+                self._send_so101_ee_delta_command(action, include_gripper)
+            elif "so101" not in self.robot_type:
+                if self.dual_arm:
+                    if "tienkung" in self.robot_type:
+                        next_pose = {}
+                        dual_arm_action = {
+                            "left": action[0:7],
+                            "right": action[7:14],
+                        }
 
-            self._send_pos_command(next_pose, include_gripper) 
+                        for name, action in dual_arm_action.items():
+                            curr_pose = self.currpos[name]
+                            next_pose[name] = self.compute_next_pose(curr_pose, action)
+
+                            # 裁剪到安全边界
+                            next_pose[name] = self.clip_safety_box(next_pose[name], arm_name=name)  
+
+                        self.currpos = {name: self.pose_euler2quat(pose) for name, pose in next_pose.items()}
+                    else:
+                        raise NotImplementedError("Unknown robot type")
+                else:
+                    next_pose = self.compute_next_pose(self.currpos, action)
+                    next_pose = self.clip_safety_box(next_pose)
+                    self.currpos = self.pose_euler2quat(next_pose)
+
+                self._send_pos_command(next_pose, include_gripper) 
 
             # curr_pose_euler = self.pose_quat2euler(obs['arm_pose']['single'])
         else:
@@ -496,12 +519,19 @@ class BaseEnv(gym.Env):
                 self._send_joint_command(target_joint, include_gripper=True, action_units=action_units)
                 time.sleep(1 / self.hz)
 
+        skip_start_wait = bool(getattr(self, "_skip_next_start_wait", False))
+        if skip_start_wait:
+            self._skip_next_start_wait = False
+
         print("\n[环境重置] 从臂正在回到 reset 位姿，请注意避让。", flush=True)
         self.go_to_reset(joint_reset=True)      
-        shared_state.terminate = False
-        print("[等待开始] 请摆好方块和杯子；确认安全后按 Space 开始下一条录制。", flush=True)
-        while not shared_state.terminate:
-            continue
+        if skip_start_wait:
+            print("[等待开始] 已在 SO101 对齐阶段确认，直接开始下一条录制。", flush=True)
+        else:
+            shared_state.terminate = False
+            print("[等待开始] 请摆好方块和杯子；确认安全后按 Space 开始下一条录制。", flush=True)
+            while not shared_state.terminate:
+                time.sleep(0.05)
         shared_state.terminate = False
 
         self.curr_path_length = 0
@@ -617,6 +647,26 @@ class BaseEnv(gym.Env):
 
                 self._send_pos_command(reset_pose, include_gripper=False)
                 time.sleep(1 / self.hz)
+
+
+    def _send_so101_ee_delta_command(self, action: np.ndarray, include_gripper=False):
+        action = np.asarray(action, dtype=np.float32).reshape(-1)
+        if action.shape[0] != 4:
+            raise ValueError(f"SO101 pose action must be [dx, dy, dz, gripper], got shape {action.shape}")
+
+        gripper_value = action[-1] if include_gripper else self.last_gripper_value
+        gripper_value_binary = 1.0 if float(gripper_value) >= 0.5 else 0.0
+        if include_gripper:
+            self.last_gripper_value = gripper_value_binary
+            self.last_gripper_units = "policy"
+
+        robot_target = {
+            "ee_delta": {"single": np.asarray(action[:3], dtype=np.float32)},
+            "hand_joints": {"single": self.last_gripper_value},
+            "so101_ee_delta_units": "policy",
+            "so101_gripper_units": "policy",
+        }
+        return self.robot_station.step_ee(robot_target)
 
 
     def _send_joint_command(self, joints: np.ndarray, include_gripper=False, action_units=None):
@@ -797,6 +847,7 @@ class BaseEnv(gym.Env):
                 if "tienkung" in self.robot_type:
                     state_observation = {
                         "tcp_pose": self._flatten(self.currpos),
+                        "ee_pos": self._flatten({name: np.asarray(pose)[:3] for name, pose in self.currpos.items()}),
                         "gripper_pose": self._flatten(self.curr_gripper_joints),
                         "joints": self._flatten(self.curr_arm_joints),
                     }
@@ -806,6 +857,7 @@ class BaseEnv(gym.Env):
             else:
                 state_observation = {
                     "tcp_pose": self.currpos,
+                    "ee_pos": np.asarray(self.currpos, dtype=np.float32)[:3],
                     "gripper_pose": self.curr_gripper_joints,
                     "joints": self.curr_arm_joints,
                 }

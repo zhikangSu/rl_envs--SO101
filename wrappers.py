@@ -222,12 +222,18 @@ class SpaceMouseIntervention(gym.ActionWrapper):
 
 
 class SO101LeaderIntervention(gym.ActionWrapper):
-    """SO101 leader-arm intervention for joint control.
+    """SO101 leader-arm intervention.
 
     Default mode is policy-autonomous: the policy command is sent to the follower, and
     the leader is servoed to mirror the follower's current joint state. If the operator
     pulls the leader away from the mirrored pose, the wrapper switches to intervention:
-    leader torque is disabled and follower commands are replaced by leader joint targets.
+    leader torque is disabled and follower commands are replaced by leader commands.
+
+    In joint mode, takeover sends raw leader joint targets. In SO101 EE-delta mode,
+    policy actions stay low-dimensional, but takeover execution uses raw leader
+    joint targets so the follower mirrors the whole arm like native teleoperation.
+    The transition stored for learning is still converted back to
+    [dx, dy, dz, gripper] from the actual follower EE motion.
 
     Release uses a small state machine instead of a raw threshold. After takeover, the
     wrapper waits until the leader has been still for a few ticks and leader/follower
@@ -243,9 +249,26 @@ class SO101LeaderIntervention(gym.ActionWrapper):
         release_motion_threshold_deg=0.75,
         min_intervention_s=0.5,
         release_queue_size=4,
+        ee_error_threshold_m=0.025,
+        ee_release_error_threshold_m=0.008,
+        manual_takeover_enabled=True,
+        auto_takeover_enabled=False,
+        release_guard_s=0.6,
+        release_settle_timeout_s=1.0,
+        hold_p_coefficient=32,
+        hold_d_coefficient=32,
     ):
         super().__init__(env)
+        self.control_mode = self.env.unwrapped.control_mode
         self.error_threshold = float(error_threshold_deg)
+        self.ee_error_threshold = float(ee_error_threshold_m)
+        self.ee_release_error_threshold = float(ee_release_error_threshold_m)
+        self.manual_takeover_enabled = bool(manual_takeover_enabled)
+        self.auto_takeover_enabled = bool(auto_takeover_enabled)
+        self.release_guard_s = float(release_guard_s)
+        self.release_settle_timeout_s = float(release_settle_timeout_s)
+        self.hold_p_coefficient = int(hold_p_coefficient)
+        self.hold_d_coefficient = int(hold_d_coefficient)
         self.gripper_binary_threshold = float(gripper_binary_threshold_pct)
         if release_error_threshold_deg is None:
             release_error_threshold_deg = max(2.0, self.error_threshold * 0.5)
@@ -259,14 +282,29 @@ class SO101LeaderIntervention(gym.ActionWrapper):
         self.leader = None
         self._leader_motor_names = None
         self.leader_torque_enabled = False
+        self.manual_intervention = False
+        self.is_release_settling = False
+        self.release_settle_target = None
+        self.release_settle_started_at = None
+        self.release_guard_until = 0.0
+        self._last_torque_warning_at = 0.0
+        self.leader_torque_faulted = False
+        self._leader_torque_fault_message = None
+        # After a Feetech overload trip, keep the leader limp until this time so the
+        # protection latch clears; enable retries automatically afterwards.
+        self._torque_retry_after = 0.0
+        self._torque_cooldown_s = 3.0
         cfg = self.env.unwrapped.config
+        self._station = self.env.unwrapped.robot_station
         self._joint_min = np.asarray(list(cfg.so101_joint_action_min), dtype=np.float32)
         self._joint_max = np.asarray(list(cfg.so101_joint_action_max), dtype=np.float32)
-        # Cache follower so we can bypass max_relative_target during human takeover.
-        # The per-tick clamp is a safety net for the policy; while a human is driving
-        # the leader, it just throttles the follower below leader hand speed and the
-        # follower never reaches the leader's pose. Save the original cap and disable
-        # it on _start_intervention, restore it on _finish_intervention.
+        self._ee_delta_scale = np.asarray(
+            list(getattr(cfg, "so101_ee_delta_scale_m", [0.035, 0.030, 0.060])),
+            dtype=np.float32,
+        )
+        # Cache follower so human takeover can temporarily bypass max_relative_target.
+        # The cap is restored before policy control resumes; policy EE-delta actions
+        # still keep the per-tick joint cap as the final hardware safety net.
         self._follower = self.env.unwrapped.robot_station.follower
         self._saved_max_relative_target = None
         self._setup_leader()
@@ -285,12 +323,12 @@ class SO101LeaderIntervention(gym.ActionWrapper):
         self._leader_motor_names = list(self.leader.bus.motors)
         for motor in self._leader_motor_names:
             try:
-                self.leader.bus.write("P_Coefficient", motor, 16)
+                self.leader.bus.write("P_Coefficient", motor, self.hold_p_coefficient)
                 self.leader.bus.write("I_Coefficient", motor, 0)
-                self.leader.bus.write("D_Coefficient", motor, 16)
+                self.leader.bus.write("D_Coefficient", motor, self.hold_d_coefficient)
             except Exception as exc:
                 logging.warning(
-                    "[SO101LeaderIntervention] failed to soften leader gains for %s: %s",
+                    "[SO101LeaderIntervention] failed to configure leader gains for %s: %s",
                     motor,
                     exc,
                 )
@@ -305,15 +343,65 @@ class SO101LeaderIntervention(gym.ActionWrapper):
         obs = self.env.unwrapped.robot_station.get_obs()
         return np.asarray(obs["arm_joints"]["single"], dtype=np.float32)
 
-    def _enable_leader_torque(self):
-        if not self.leader_torque_enabled:
-            self.leader.bus.sync_write("Torque_Enable", 1)
-            self.leader_torque_enabled = True
+    def _warn_leader_torque(self, message, exc):
+        logging.warning("[SO101LeaderIntervention] %s: %s", message, exc)
+        now = time.perf_counter()
+        if now - self._last_torque_warning_at >= 2.0:
+            print(f"[警告] {message}：{exc}", flush=True)
+            self._last_torque_warning_at = now
 
-    def _disable_leader_torque(self):
+    def _enable_leader_torque(self):
+        if self.leader_torque_faulted:
+            return False
         if self.leader_torque_enabled:
-            self.leader.bus.sync_write("Torque_Enable", 0)
+            return True
+        if time.perf_counter() < self._torque_retry_after:
+            # Cooling down after a Feetech overload trip: keep the leader limp so the
+            # servo's protection latch clears; the next tick retries automatically.
+            return False
+        try:
+            self.leader.bus.enable_torque(num_retry=2)
+        except Exception as exc:
             self.leader_torque_enabled = False
+            if "overload" in str(exc).lower():
+                # Overload protection (usually the elbow under gravity). Relieve the load
+                # by forcing torque off and back off for a cooldown, then retry — instead
+                # of latching a permanent fault that leaves the arm stuck until restart.
+                self._relieve_leader_overload()
+                self._torque_retry_after = time.perf_counter() + self._torque_cooldown_s
+                self._warn_leader_torque("主臂过载保护触发，已卸力冷却后自动重试", exc)
+            else:
+                self.leader_torque_faulted = True
+                self._leader_torque_fault_message = str(exc)
+                self._warn_leader_torque("主臂上扭矩失败，已保持为无扭矩状态", exc)
+            return False
+        self.leader_torque_enabled = True
+        self._torque_retry_after = 0.0
+        return True
+
+    def _relieve_leader_overload(self):
+        """Force the leader torque off so a Feetech overload protection latch can clear."""
+        try:
+            self.leader.bus.disable_torque(num_retry=2)
+        except Exception:
+            pass
+        self.leader_torque_enabled = False
+
+    def _disable_leader_torque(self, force=False):
+        success = True
+        if self.leader_torque_faulted and not self.leader_torque_enabled:
+            return False
+        if self.leader_torque_enabled or force:
+            try:
+                self.leader.bus.disable_torque(num_retry=2)
+            except Exception as exc:
+                success = False
+                self.leader_torque_faulted = True
+                self._leader_torque_fault_message = str(exc)
+                self._warn_leader_torque("主臂关扭矩失败，将继续按无扭矩状态处理", exc)
+            finally:
+                self.leader_torque_enabled = False
+        return success
 
     def _mirror_leader_to_follower(self):
         """Drive leader to match follower current joint state (active servo).
@@ -327,17 +415,49 @@ class SO101LeaderIntervention(gym.ActionWrapper):
         """
         follower = self._read_follower_joints()  # 6-dim (5 arm + 1 gripper)
         goal = {f"{n}": float(follower[i]) for i, n in enumerate(self._leader_motor_names)}
-        self.leader.bus.sync_write("Goal_Position", goal)
-        self._enable_leader_torque()
+        try:
+            self.leader.bus.sync_write("Goal_Position", goal)
+        except Exception as exc:
+            self._warn_leader_torque("主臂同步 follower 目标位姿失败", exc)
+            return False
+        return self._enable_leader_torque()
 
-    def _leader_to_action(self, leader):
-        # Match lerobot-teleoperate for takeover: send the leader's current
-        # LeRobot motor-normalized joint targets directly to the follower.
+    def _hold_leader_at_pose(self, leader_target):
+        """Hold the leader at its current operator-selected pose."""
+        goal = {f"{n}": float(leader_target[i]) for i, n in enumerate(self._leader_motor_names)}
+        try:
+            self.leader.bus.sync_write("Goal_Position", goal)
+        except Exception as exc:
+            self._warn_leader_torque("主臂保持当前位置失败", exc)
+            return False
+        return self._enable_leader_torque()
+
+    def _ee_error(self, leader, follower):
+        leader_pose = self._station.get_ee_pose_from_joint(leader)
+        follower_pose = self._station.get_ee_pose_from_joint(follower)
+        return float(np.linalg.norm(leader_pose[:3] - follower_pose[:3]))
+
+    def _leader_to_action(self, leader, follower):
+        # Match lerobot-teleoperate for joint-mode takeover: send the leader's
+        # current LeRobot motor-normalized joint targets directly to the follower.
         return leader.astype(np.float32, copy=True)
+
+    def _ee_delta_action_from_motion(self, before_follower, after_follower, gripper_source):
+        before_pose = self._station.get_ee_pose_from_joint(before_follower)
+        after_pose = self._station.get_ee_pose_from_joint(after_follower)
+        delta_m = after_pose[:3] - before_pose[:3]
+        action = np.zeros((4,), dtype=np.float32)
+        action[:3] = np.clip(delta_m / (self._ee_delta_scale + 1e-8), -1.0, 1.0)
+        action[3] = 1.0 if gripper_source[-1] > self.gripper_binary_threshold else 0.0
+        return action
 
     def _normalize_action_for_policy(self, action):
         """Convert executed physical SO101 action to policy training scale."""
         action = np.asarray(action, dtype=np.float32).copy()
+        if self.control_mode == "pose":
+            action[:3] = np.clip(action[:3], -1.0, 1.0)
+            action[3] = 1.0 if action[3] >= 0.5 else 0.0
+            return action
         action[:5] = 2.0 * (action[:5] - self._joint_min) / (self._joint_max - self._joint_min + 1e-8) - 1.0
         action[:5] = np.clip(action[:5], -1.0, 1.0)
         action[5] = 1.0 if action[5] > self.gripper_binary_threshold else 0.0
@@ -352,76 +472,228 @@ class SO101LeaderIntervention(gym.ActionWrapper):
         self.prev_leader_arm = arm
         return motion
 
-    def _start_intervention(self, arm_err):
+    def _manual_takeover_requested(self):
+        return self.manual_takeover_enabled and bool(
+            getattr(shared_state, "leader_manual_takeover", False)
+        )
+
+    def _start_intervention(self, arm_err, manual=False):
         self.is_intervening = True
+        self.manual_intervention = bool(manual)
         self.intervention_started_at = time.perf_counter()
         self.leader_motion_queue.clear()
-        self._disable_leader_torque()
-        # Bypass the per-tick relative-target cap so the follower can keep up
-        # with leader hand motion (native servo speed ~300°/s vs. capped 60°/s).
+        self._disable_leader_torque(force=True)
+        # During human takeover we execute raw leader joint targets, matching native
+        # LeRobot teleoperation. Bypass the per-tick policy safety cap so the follower
+        # can actually catch up to the leader; restore it before policy control resumes.
         if self._saved_max_relative_target is None:
             self._saved_max_relative_target = self._follower.config.max_relative_target
             self._follower.config.max_relative_target = None
         logging.info(
-            "[SO101LeaderIntervention] takeover started: leader/follower arm error %.2f calibrated units",
+            "[SO101LeaderIntervention] takeover started (%s): leader/follower arm error %.4f %s",
+            "manual" if self.manual_intervention else "auto",
             arm_err,
+            "m" if self.control_mode == "pose" else "calibrated units",
+        )
+        print(
+            f"[接管] {'手动' if self.manual_intervention else '自动'}接管已开启：从臂跟随主臂。",
+            flush=True,
         )
 
-    def _should_release(self, arm_err):
+    def _active_arm_error(self, joint_err, ee_err):
+        return ee_err if self.control_mode == "pose" else joint_err
+
+    def _should_start_intervention(self, joint_err, ee_err, manual_requested=False):
+        if manual_requested:
+            return True
+        if not self.auto_takeover_enabled:
+            return False
+        if time.perf_counter() < self.release_guard_until:
+            return False
+        if self.control_mode == "pose":
+            return ee_err is not None and ee_err > self.ee_error_threshold
+        return joint_err > self.error_threshold
+
+    def _should_release(self, arm_err, manual_requested=False):
         if not self.is_intervening or self.intervention_started_at is None:
             return False
+        if self.manual_intervention:
+            return not manual_requested
         if time.perf_counter() - self.intervention_started_at < self.min_intervention_s:
             return False
         if len(self.leader_motion_queue) < self.leader_motion_queue.maxlen:
             return False
+        release_threshold = (
+            self.ee_release_error_threshold
+            if self.control_mode == "pose"
+            else self.release_error_threshold
+        )
         return (
-            arm_err <= self.release_error_threshold
+            arm_err <= release_threshold
             and max(self.leader_motion_queue) <= self.release_motion_threshold
         )
 
-    def _finish_intervention(self, arm_err):
-        self.is_intervening = False
-        self.intervention_started_at = None
-        self.leader_motion_queue.clear()
-        # Restore the per-tick cap before handing control back to the policy.
+    def _restore_policy_joint_cap(self):
         if self._saved_max_relative_target is not None:
             self._follower.config.max_relative_target = self._saved_max_relative_target
             self._saved_max_relative_target = None
-        self._mirror_leader_to_follower()
+
+    def _start_release_settle(self, leader_target, arm_err):
+        self.is_intervening = False
+        self.manual_intervention = False
+        self.intervention_started_at = None
+        self.leader_motion_queue.clear()
+        self.is_release_settling = True
+        self.release_settle_target = np.asarray(leader_target, dtype=np.float32).copy()
+        self.release_settle_started_at = time.perf_counter()
+        leader_held = self._hold_leader_at_pose(self.release_settle_target)
+        if getattr(shared_state, "leader_manual_takeover", False):
+            shared_state.leader_manual_takeover = False
         logging.info(
-            "[SO101LeaderIntervention] takeover released: leader/follower arm error %.2f calibrated units",
+            "[SO101LeaderIntervention] manual takeover release settling: leader/follower arm error %.4f %s",
             arm_err,
+            "m" if self.control_mode == "pose" else "calibrated units",
         )
+        if leader_held:
+            print("[接管] 手动接管结束：主臂保持当前位置，从臂正在追到该位姿。", flush=True)
+        else:
+            print("[接管] 手动接管结束：主臂保持失败；从臂仍会追到当前主臂位姿。", flush=True)
+
+    def _finish_intervention(self, arm_err):
+        self.is_intervening = False
+        self.manual_intervention = False
+        self.is_release_settling = False
+        self.release_settle_target = None
+        self.release_settle_started_at = None
+        self.intervention_started_at = None
+        self.leader_motion_queue.clear()
+        self._restore_policy_joint_cap()
+        self.release_guard_until = time.perf_counter() + self.release_guard_s
+        if getattr(shared_state, "leader_manual_takeover", False):
+            shared_state.leader_manual_takeover = False
+        logging.info(
+            "[SO101LeaderIntervention] takeover released: leader/follower arm error %.4f %s",
+            arm_err,
+            "m" if self.control_mode == "pose" else "calibrated units",
+        )
+        self._mirror_leader_to_follower()
+        print("[接管] 从臂已追上主臂，恢复 policy 自主控制。", flush=True)
+
+    def _release_leader_for_operator(self):
+        """Leave the leader freely movable while the operator resets the scene."""
+        if not self.leader_torque_enabled:
+            return
+        was_faulted = self.leader_torque_faulted
+        ok = self._disable_leader_torque(force=True)
+        if ok:
+            return
+        if self.leader_torque_faulted and not was_faulted:
+            print(
+                "[警告] 主臂扭矩释放失败，已停止主动镜像；请先让主臂卸力/断电重启再继续。",
+                flush=True,
+            )
+
+    def _step_release_settle(self):
+        target = self.release_settle_target
+        if target is None:
+            self._finish_intervention(0.0)
+            return self.env.step({"action": self._read_follower_joints(), "so101_action_units": "raw", "so101_action_mode": "joint"})
+
+        before_follower = self._read_follower_joints()
+        obs, rew, terminated, truncated, info = self.env.step(
+            {"action": target, "so101_action_units": "raw", "so101_action_mode": "joint"}
+        )
+        post_follower = self._read_follower_joints()
+        post_joint_err = float(np.linalg.norm(target[:-1] - post_follower[:-1]))
+        post_ee_err = self._ee_error(target, post_follower) if self.control_mode == "pose" else None
+        post_arm_err = self._active_arm_error(post_joint_err, post_ee_err)
+        elapsed = time.perf_counter() - (self.release_settle_started_at or time.perf_counter())
+        release_threshold = (
+            self.ee_release_error_threshold
+            if self.control_mode == "pose"
+            else self.release_error_threshold
+        )
+        if post_arm_err <= release_threshold or elapsed >= self.release_settle_timeout_s:
+            self._finish_intervention(post_arm_err)
+        if self.control_mode == "pose":
+            intervene_action = self._ee_delta_action_from_motion(
+                before_follower=before_follower,
+                after_follower=post_follower,
+                gripper_source=target,
+            )
+        else:
+            intervene_action = self._normalize_action_for_policy(target)
+        info["intervene_action"] = intervene_action
+        info["is_intervention"] = True
+        info["manual_takeover"] = False
+        info["release_settle"] = True
+        info["leader_follower_arm_error_deg"] = post_joint_err
+        if post_ee_err is not None:
+            info["leader_follower_ee_error_m"] = post_ee_err
+        info["leader_motion_deg"] = 0.0
+        return obs, rew, terminated, truncated, info
 
     def step(self, action):
+        if self.is_release_settling:
+            return self._step_release_settle()
+
         leader = self._read_leader_joints()
         follower = self._read_follower_joints()
-        arm_err = float(np.linalg.norm(leader[:-1] - follower[:-1]))
+        joint_err = float(np.linalg.norm(leader[:-1] - follower[:-1]))
+        ee_err = self._ee_error(leader, follower) if self.control_mode == "pose" else None
+        arm_err = self._active_arm_error(joint_err, ee_err)
         leader_motion = self._record_leader_motion(leader)
+        manual_requested = self._manual_takeover_requested()
 
-        if not self.is_intervening and arm_err > self.error_threshold:
-            self._start_intervention(arm_err)
+        if self.is_intervening and manual_requested:
+            self.manual_intervention = True
+
+        if not self.is_intervening and self._should_start_intervention(
+            joint_err, ee_err, manual_requested=manual_requested
+        ):
+            self._start_intervention(arm_err, manual=manual_requested)
 
         if self.is_intervening:
+            leader_action = self._leader_to_action(leader, follower)
             new_action = {
-                "action": self._leader_to_action(leader),
+                "action": leader_action,
                 "so101_action_units": "raw",
+                "so101_action_mode": "joint",
             }
             obs, rew, terminated, truncated, info = self.env.step(new_action)
             post_follower = self._read_follower_joints()
-            post_arm_err = float(np.linalg.norm(leader[:-1] - post_follower[:-1]))
-            if self._should_release(post_arm_err):
-                self._finish_intervention(post_arm_err)
-            info["intervene_action"] = self._normalize_action_for_policy(new_action["action"])
+            post_joint_err = float(np.linalg.norm(leader[:-1] - post_follower[:-1]))
+            post_ee_err = self._ee_error(leader, post_follower) if self.control_mode == "pose" else None
+            post_arm_err = self._active_arm_error(post_joint_err, post_ee_err)
+            if self._should_release(post_arm_err, manual_requested=manual_requested):
+                if self.manual_intervention:
+                    self._start_release_settle(leader, post_arm_err)
+                else:
+                    self._finish_intervention(post_arm_err)
+            if self.control_mode == "pose":
+                intervene_action = self._ee_delta_action_from_motion(
+                    before_follower=follower,
+                    after_follower=post_follower,
+                    gripper_source=leader,
+                )
+            else:
+                intervene_action = self._normalize_action_for_policy(leader_action)
+            info["intervene_action"] = intervene_action
             info["is_intervention"] = True
-            info["leader_follower_arm_error_deg"] = post_arm_err
+            info["manual_takeover"] = bool(self.manual_intervention)
+            info["leader_follower_arm_error_deg"] = post_joint_err
+            if post_ee_err is not None:
+                info["leader_follower_ee_error_m"] = post_ee_err
             info["leader_motion_deg"] = leader_motion
             return obs, rew, terminated, truncated, info
 
         obs, rew, terminated, truncated, info = self.env.step(action)
         self._mirror_leader_to_follower()
         info["is_intervention"] = False
-        info["leader_follower_arm_error_deg"] = arm_err
+        info["manual_takeover"] = False
+        info["leader_follower_arm_error_deg"] = joint_err
+        if ee_err is not None:
+            info["leader_follower_ee_error_m"] = ee_err
         info["leader_motion_deg"] = leader_motion
         return obs, rew, terminated, truncated, info
 
@@ -432,6 +704,12 @@ class SO101LeaderIntervention(gym.ActionWrapper):
         if self._saved_max_relative_target is not None:
             self._follower.config.max_relative_target = self._saved_max_relative_target
             self._saved_max_relative_target = None
+        self.manual_intervention = False
+        self.is_release_settling = False
+        self.release_settle_target = None
+        self.release_settle_started_at = None
+        shared_state.leader_manual_takeover = False
+        self._release_leader_for_operator()
 
         base = self.env.unwrapped
 
@@ -473,27 +751,34 @@ class SO101LeaderIntervention(gym.ActionWrapper):
         base._reset_joint = follower_aligned[: base.joint_dim].astype(np.float32, copy=True)
         base.last_gripper_value = float(np.clip(follower_aligned[base.joint_dim], 0.0, 100.0))
         base.last_gripper_units = "raw"
-        shared_state.terminate = True  # skip env.reset's own Space wait
+        base._skip_next_start_wait = True
+        shared_state.terminate = False
         obs, info = self.env.reset(**kwargs)
 
         self.is_intervening = False
+        self.manual_intervention = False
         self.intervention_started_at = None
         self.leader_motion_queue.clear()
         leader = self._read_leader_joints()
         follower = self._read_follower_joints()
         self.prev_leader_arm = leader[:-1].astype(np.float32, copy=True)
-        arm_err = float(np.linalg.norm(leader[:-1] - follower[:-1]))
-        if arm_err > self.error_threshold:
-            self._start_intervention(arm_err)
+        joint_err = float(np.linalg.norm(leader[:-1] - follower[:-1]))
+        ee_err = self._ee_error(leader, follower) if self.control_mode == "pose" else None
+        arm_err = self._active_arm_error(joint_err, ee_err)
+        if self._should_start_intervention(joint_err, ee_err, manual_requested=False):
+            self._start_intervention(arm_err, manual=False)
         else:
-            self._mirror_leader_to_follower()
+            self._release_leader_for_operator()
         info["is_intervention"] = self.is_intervening
-        info["leader_follower_arm_error_deg"] = arm_err
+        info["manual_takeover"] = self.manual_intervention
+        info["leader_follower_arm_error_deg"] = joint_err
+        if ee_err is not None:
+            info["leader_follower_ee_error_m"] = ee_err
         return obs, info
 
     def close(self):
         try:
-            self._disable_leader_torque()
+            self._disable_leader_torque(force=True)
         finally:
             if self.leader is not None:
                 try:
@@ -568,15 +853,12 @@ class SERLObsWrapper(gym.ObservationWrapper):
 
     def __init__(self, env, proprio_keys=None, use_force=False):
         super().__init__(env)
-        if use_force:
-            self.proprio_keys = proprio_keys
+        if proprio_keys is None:
+            self.proprio_keys = list(self.env.observation_space["state"].keys())
         else:
-            self.proprio_keys = proprio_keys[:2]
+            self.proprio_keys = list(proprio_keys)
 
         print("proprio_keys:", self.proprio_keys)    
-
-        if self.proprio_keys is None:
-            self.proprio_keys = list(self.env.observation_space["state"].keys())
 
         self.proprio_space = gym.spaces.Dict(
             OrderedDict((key, self.env.observation_space["state"][key]) for key in self.proprio_keys)
