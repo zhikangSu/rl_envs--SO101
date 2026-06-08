@@ -92,13 +92,13 @@ class MultiCameraBinaryRewardClassifierWrapper(gym.Wrapper):
         self.shape_enable = True
         self.shape_alpha = 10.0          # shaping weight (tunable)
         self.shape_gamma = 0.99          # = policy discount
-        # x,y from the 20 demos (match live grasps); z from LIVE grasp height: the policy
-        # (cloning the demos) closes the gripper at ee_z~0.017 live, ~2.5cm below the demo
-        # z=0.04 -> a z-frame offset (likely a lift-servo recal since the demos). The reward
-        # runs in the LIVE frame, so use the live z or it would stop ~2.5cm above the cube.
-        self.cube_xyz = torch.tensor([0.192, 0.098, 0.018], dtype=torch.float32)
-        self.plate_xyz = torch.tensor([0.270, 0.000, 0.100], dtype=torch.float32)  # x,y demo; z=lifted carry point (live carry reaches z~0.11)
-        self.grip_closed_thresh = 12.0   # state[5] raw 0-38 (open~4, closed~24); NOTE: action gripper is 0/1, but reward uses state[5]
+        # M-hotkey LIVE-frame calibration (operator gripped the cube, then held it over the
+        # plate, pressing M at each). Exact targets in the current robot frame -> avoids the
+        # ~2.9cm z offset between the demo recording frame and the live frame (demo grasp
+        # z=0.04 vs live z=0.011). plate is ~5.4cm above grasp -> natural lift, no drag.
+        self.cube_xyz = torch.tensor([0.2004, 0.0937, 0.0114], dtype=torch.float32)   # gripper grasping the cube
+        self.plate_xyz = torch.tensor([0.2632, -0.0070, 0.0649], dtype=torch.float32)  # cube held over the plate
+        self.grip_closed_thresh = 12.0   # state[5] raw 0-38 (open~4, closed~24); NOTE: action gripper is 0/1, reward uses state[5]
         self._D = float(torch.linalg.norm(self.cube_xyz - self.plate_xyz))
         self.prev_phi = None
         self._shape_dbg = 0
