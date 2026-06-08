@@ -92,9 +92,13 @@ class MultiCameraBinaryRewardClassifierWrapper(gym.Wrapper):
         self.shape_enable = True
         self.shape_alpha = 10.0          # shaping weight (tunable)
         self.shape_gamma = 0.99          # = policy discount
-        self.cube_xyz = torch.tensor([0.194, 0.097, 0.045], dtype=torch.float32)
-        self.plate_xyz = torch.tensor([0.276, 0.000, 0.100], dtype=torch.float32)  # lifted over plate
-        self.grip_closed_thresh = 12.0   # state[5] raw 0-38 (open~4, closed~24)
+        # x,y from the 20 demos (match live grasps); z from LIVE grasp height: the policy
+        # (cloning the demos) closes the gripper at ee_z~0.017 live, ~2.5cm below the demo
+        # z=0.04 -> a z-frame offset (likely a lift-servo recal since the demos). The reward
+        # runs in the LIVE frame, so use the live z or it would stop ~2.5cm above the cube.
+        self.cube_xyz = torch.tensor([0.192, 0.098, 0.018], dtype=torch.float32)
+        self.plate_xyz = torch.tensor([0.270, 0.000, 0.100], dtype=torch.float32)  # x,y demo; z=lifted carry point (live carry reaches z~0.11)
+        self.grip_closed_thresh = 12.0   # state[5] raw 0-38 (open~4, closed~24); NOTE: action gripper is 0/1, but reward uses state[5]
         self._D = float(torch.linalg.norm(self.cube_xyz - self.plate_xyz))
         self.prev_phi = None
         self._shape_dbg = 0
@@ -198,6 +202,14 @@ class MultiCameraBinaryRewardClassifierWrapper(gym.Wrapper):
         step_st_time = time.time()
         self.time_step += 1
         obs, rew, _, truncated, info = self.env.step(action)
+
+        # [M hotkey] print the current EE position once, to calibrate the reward-shaping
+        # target points (cube_xyz / plate_xyz) directly in the LIVE robot frame.
+        if getattr(shared_state, "print_pos_request", False):
+            shared_state.print_pos_request = False
+            _s = obs["state"]
+            print(f"\n[M 标定] 当前 ee_xyz = [{float(_s[6]):.4f}, {float(_s[7]):.4f}, {float(_s[8]):.4f}]  "
+                  f"gripper(state[5])={float(_s[5]):.1f}\n", flush=True)
         reward_st_time = time.time()
         reward_obs = copy.deepcopy(obs)
         reward_obs = make_policy_obs(reward_obs, self.device, self.robot_type)

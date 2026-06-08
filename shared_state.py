@@ -9,5 +9,8 @@ class SharedState:
     # Set by the 'S' hotkey to ask the learner to save a FULL checkpoint (model +
     # replay buffers) on demand, so the run can be resumed later.
     save_checkpoint_request = False
+    # Set by the 'M' hotkey to print the current end-effector position once, for
+    # calibrating reward-shaping target points (cube_xyz / plate_xyz) in the LIVE frame.
+    print_pos_request = False
 
 shared_state = SharedState()
