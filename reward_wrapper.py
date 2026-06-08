@@ -81,29 +81,6 @@ class MultiCameraBinaryRewardClassifierWrapper(gym.Wrapper):
         self.batch_size = classifier_cfg.batch_size
         self.require_train = classifier_cfg.require_train
 
-        # ===== STAGE-1 dense reward shaping (fixed cube) — potential-based, table-crash-safe =====
-        # Pre-grasp: pull EE toward the cube (a fixed point AT cube height, NOT "down" -> the
-        # potential's max is AT the cube, so it descends and STOPS, never down into the table).
-        # Post-grasp (gripper closed): pull toward a LIFTED point over the plate -> the arm
-        # lifts and carries, never drags. The +self._D offset makes the potential continuous at
-        # the grasp point so PBRS (potential-based) shaping adds no spurious jump and provably
-        # does not change the optimal policy. Constants auto-extracted from the 20 fixed-cube
-        # demos (grasp/release EE pos, cross-demo std < 1 cm). Actor-side reward only.
-        self.shape_enable = True
-        self.shape_alpha = 10.0          # shaping weight (tunable)
-        self.shape_gamma = 0.99          # = policy discount
-        # M-hotkey LIVE-frame calibration (operator gripped the cube, then held it over the
-        # plate, pressing M at each). Exact targets in the current robot frame -> avoids the
-        # ~2.9cm z offset between the demo recording frame and the live frame (demo grasp
-        # z=0.04 vs live z=0.011). plate is ~5.4cm above grasp -> natural lift, no drag.
-        self.cube_xyz = torch.tensor([0.2004, 0.0937, 0.0114], dtype=torch.float32)   # gripper grasping the cube
-        self.plate_xyz = torch.tensor([0.2632, -0.0070, 0.0649], dtype=torch.float32)  # cube held over the plate
-        self.grip_closed_thresh = 12.0   # state[5] raw 0-38 (open~4, closed~24); NOTE: action gripper is 0/1, reward uses state[5]
-        self._D = float(torch.linalg.norm(self.cube_xyz - self.plate_xyz))
-        self.prev_phi = None
-        self._grasped = False   # latched per episode: True once the gripper has closed
-        self._shape_dbg = 0
-
 
         if self.require_train and self.load_classifier:
             self.save_dir = os.path.join(os.getcwd(), classifier_cfg.checkpoint_path, "../../")
@@ -164,17 +141,6 @@ class MultiCameraBinaryRewardClassifierWrapper(gym.Wrapper):
 
 
 
-    def _phi(self, state):
-        """PBRS potential = -(remaining task distance). Continuous at the grasp point.
-        Pre-grasp target = cube (so it descends to the cube and stops, not into the table);
-        post-grasp target = lifted point over the plate (so it lifts+carries, not drags)."""
-        ee = torch.as_tensor(state[6:9], dtype=torch.float32)
-        if self._grasped:   # LATCHED (set once the gripper closes); releasing over the
-            remaining = float(torch.linalg.norm(ee - self.plate_xyz))   # plate keeps target=plate
-        else:
-            remaining = float(torch.linalg.norm(ee - self.cube_xyz)) + self._D
-        return -remaining
-
     def reset(self, **kwargs):
         # todo: change here to False
         shared_state.terminate = False
@@ -194,23 +160,13 @@ class MultiCameraBinaryRewardClassifierWrapper(gym.Wrapper):
         self.time_step = 0
         info['succeed'] = False
         self.accuracy_sum = 0.0
-        self.accuracy_count = 0
-        self._grasped = False
-        self.prev_phi = self._phi(obs["state"]) if self.shape_enable else None
+        self.accuracy_count = 0 
         return obs, info
     
     def step(self, action):
         step_st_time = time.time()
         self.time_step += 1
         obs, rew, _, truncated, info = self.env.step(action)
-
-        # [M hotkey] print the current EE position once, to calibrate the reward-shaping
-        # target points (cube_xyz / plate_xyz) directly in the LIVE robot frame.
-        if getattr(shared_state, "print_pos_request", False):
-            shared_state.print_pos_request = False
-            _s = obs["state"]
-            print(f"\n[M 标定] 当前 ee_xyz = [{float(_s[6]):.4f}, {float(_s[7]):.4f}, {float(_s[8]):.4f}]  "
-                  f"gripper(state[5])={float(_s[5]):.1f}\n", flush=True)
         reward_st_time = time.time()
         reward_obs = copy.deepcopy(obs)
         reward_obs = make_policy_obs(reward_obs, self.device, self.robot_type)
@@ -377,22 +333,6 @@ class MultiCameraBinaryRewardClassifierWrapper(gym.Wrapper):
 
         self.last_obs = reward_obs
         info['succeed'] = bool(terminated)
-
-        # ===== dense reward shaping (potential-based; actor-side only) =====
-        if self.shape_enable and self.prev_phi is not None:
-            if float(obs["state"][5]) > self.grip_closed_thresh:
-                self._grasped = True   # latch: stay post-grasp (target=plate) even after release
-            phi_next = 0.0 if terminated else self._phi(obs["state"])
-            shape_r = self.shape_alpha * (self.shape_gamma * phi_next - self.prev_phi)
-            rew = float(rew) + shape_r
-            self._shape_dbg += 1
-            if self._shape_dbg % 30 == 0:
-                ee = obs["state"][6:9]; g = float(obs["state"][5])
-                tgt = "plate" if g > self.grip_closed_thresh else "cube"
-                print(f"[shaping] ee=[{ee[0]:.3f},{ee[1]:.3f},{ee[2]:.3f}] grip={g:.1f} "
-                      f"target={tgt} phi={self.prev_phi:+.3f} shape_r={shape_r:+.3f} rew={rew:+.3f}",
-                      flush=True)
-            self.prev_phi = None if terminated else phi_next
 
         return obs, rew, terminated, truncated, info
 
