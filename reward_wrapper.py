@@ -101,6 +101,7 @@ class MultiCameraBinaryRewardClassifierWrapper(gym.Wrapper):
         self.grip_closed_thresh = 12.0   # state[5] raw 0-38 (open~4, closed~24); NOTE: action gripper is 0/1, reward uses state[5]
         self._D = float(torch.linalg.norm(self.cube_xyz - self.plate_xyz))
         self.prev_phi = None
+        self._grasped = False   # latched per episode: True once the gripper has closed
         self._shape_dbg = 0
 
 
@@ -168,9 +169,8 @@ class MultiCameraBinaryRewardClassifierWrapper(gym.Wrapper):
         Pre-grasp target = cube (so it descends to the cube and stops, not into the table);
         post-grasp target = lifted point over the plate (so it lifts+carries, not drags)."""
         ee = torch.as_tensor(state[6:9], dtype=torch.float32)
-        closed = float(state[5]) > self.grip_closed_thresh
-        if closed:
-            remaining = float(torch.linalg.norm(ee - self.plate_xyz))
+        if self._grasped:   # LATCHED (set once the gripper closes); releasing over the
+            remaining = float(torch.linalg.norm(ee - self.plate_xyz))   # plate keeps target=plate
         else:
             remaining = float(torch.linalg.norm(ee - self.cube_xyz)) + self._D
         return -remaining
@@ -195,6 +195,7 @@ class MultiCameraBinaryRewardClassifierWrapper(gym.Wrapper):
         info['succeed'] = False
         self.accuracy_sum = 0.0
         self.accuracy_count = 0
+        self._grasped = False
         self.prev_phi = self._phi(obs["state"]) if self.shape_enable else None
         return obs, info
     
@@ -379,6 +380,8 @@ class MultiCameraBinaryRewardClassifierWrapper(gym.Wrapper):
 
         # ===== dense reward shaping (potential-based; actor-side only) =====
         if self.shape_enable and self.prev_phi is not None:
+            if float(obs["state"][5]) > self.grip_closed_thresh:
+                self._grasped = True   # latch: stay post-grasp (target=plate) even after release
             phi_next = 0.0 if terminated else self._phi(obs["state"])
             shape_r = self.shape_alpha * (self.shape_gamma * phi_next - self.prev_phi)
             rew = float(rew) + shape_r
